@@ -102,3 +102,18 @@ async def stats():
     
     conn.close()
     return results
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus-style metrics."""
+    conn = sqlite3.connect(DB_PATH)
+    total = conn.execute("SELECT COUNT(*) FROM webhooks").fetchone()[0]
+    pending = conn.execute("SELECT COUNT(*) FROM webhooks WHERE processed = 0").fetchone()[0]
+    conn.close()
+    
+    return {
+        "webhooks_total": total,
+        "webhooks_pending": pending,
+        "webhooks_processed": total - pending
+    }
