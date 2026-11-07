@@ -2,20 +2,28 @@
 
 import hashlib
 import hmac
+import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, HTTPException
 
 app = FastAPI(
     title="Webhook Relay",
-    version="0.1.0",
+    version="0.2.0",
     description="FastAPI webhook ingestion with HMAC verification and SQLite queue"
 )
 
 DB_PATH = Path.home() / ".webhook-relay.db"
+
+# HMAC secret from environment (supports multiple secrets for rotation)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_SECRETS = [s.strip() for s in WEBHOOK_SECRET.split(",") if s.strip()]
+
+# Strict mode: if True and secret is configured, reject webhooks without signatures
+WEBHOOK_STRICT_MODE = os.getenv("WEBHOOK_STRICT_MODE", "false").lower() == "true"
 
 
 def _init_db() -> None:
@@ -40,15 +48,59 @@ def _init_db() -> None:
 _init_db()
 
 
+def _verify_signature(payload: bytes, signature: str, secrets: list[str]) -> bool:
+    """
+    Verify HMAC-SHA256 signature against multiple secrets (for rotation).
+    
+    Args:
+        payload: Raw request body bytes
+        signature: Signature from X-Signature header (hex encoded)
+        secrets: List of secret keys to try
+        
+    Returns:
+        True if any secret validates the signature
+    """
+    if not secrets:
+        return True  # No secret configured, skip verification
+    
+    if not signature:
+        return False  # Signature required when secrets configured
+    
+    # Remove 'sha256=' prefix if present (GitHub style)
+    if signature.startswith("sha256="):
+        signature = signature[7:]
+    
+    for secret in secrets:
+        expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, signature):
+            return True
+    
+    return False
+
+
 @app.post("/webhook")
 async def receive_webhook(
     request: Request,
     x_signature: Optional[str] = Header(None),
     x_event_type: str = Header("generic")
 ):
-    """Receive and queue webhook."""
+    """Receive and queue webhook with HMAC verification."""
     body = await request.body()
     client_host = request.client.host if request.client else "unknown"
+    
+    # Verify HMAC signature if secrets are configured
+    if WEBHOOK_SECRETS:
+        if not _verify_signature(body, x_signature or "", WEBHOOK_SECRETS):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid HMAC signature"
+            )
+    elif WEBHOOK_STRICT_MODE and x_signature is None:
+        # Strict mode but no secret configured - reject unsigned webhooks
+        raise HTTPException(
+            status_code=401,
+            detail="Signature required in strict mode"
+        )
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
